@@ -1,56 +1,158 @@
-PROJECT = emqttd
-PROJECT_DESCRIPTION = Erlang MQTT Broker
-PROJECT_VERSION = 2.3
+$(shell $(CURDIR)/scripts/git-hooks-init.sh)
+REBAR_VERSION = 3.14.3-emqx-8
+REBAR = $(CURDIR)/rebar3
+BUILD = $(CURDIR)/build
+SCRIPTS = $(CURDIR)/scripts
+export PKG_VSN ?= $(shell $(CURDIR)/pkg-vsn.sh)
+export EMQX_DESC ?= EMQ X
+export EMQX_CE_DASHBOARD_VERSION ?= v4.3.1
+ifeq ($(OS),Windows_NT)
+	export REBAR_COLOR=none
+endif
 
-DEPS = goldrush gproc lager esockd ekka mochiweb pbkdf2 lager_syslog bcrypt clique jsx
+PROFILE ?= emqx
+REL_PROFILES := emqx emqx-edge
+PKG_PROFILES := emqx-pkg emqx-edge-pkg
+PROFILES := $(REL_PROFILES) $(PKG_PROFILES) default
 
-dep_goldrush     = git https://github.com/basho/goldrush 0.1.9
-dep_gproc        = git https://github.com/uwiger/gproc
-dep_getopt       = git https://github.com/jcomellas/getopt v0.8.2
-dep_lager        = git https://github.com/basho/lager master
-dep_esockd       = git https://github.com/emqtt/esockd master
-dep_ekka         = git https://github.com/emqtt/ekka master
-dep_mochiweb     = git https://github.com/emqtt/mochiweb master
-dep_pbkdf2       = git https://github.com/emqtt/pbkdf2 2.0.1
-dep_lager_syslog = git https://github.com/basho/lager_syslog
-dep_bcrypt       = git https://github.com/smarkets/erlang-bcrypt master
-dep_clique       = git https://github.com/emqtt/clique
-dep_jsx          = git https://github.com/talentdeficit/jsx
+export REBAR_GIT_CLONE_OPTIONS += --depth=1
 
-ERLC_OPTS += +debug_info
-ERLC_OPTS += +'{parse_transform, lager_transform}'
+.PHONY: default
+default: $(REBAR) $(PROFILE)
 
-NO_AUTOPATCH = cuttlefish
+.PHONY: all
+all: $(REBAR) $(PROFILES)
 
-BUILD_DEPS = cuttlefish
-dep_cuttlefish = git https://github.com/emqtt/cuttlefish
+.PHONY: ensure-rebar3
+ensure-rebar3:
+	@$(SCRIPTS)/fail-on-old-otp-version.escript
+	@$(SCRIPTS)/ensure-rebar3.sh $(REBAR_VERSION)
 
-TEST_DEPS = emqttc
-dep_emqttc = git https://github.com/emqtt/emqttc
+$(REBAR): ensure-rebar3
 
-TEST_ERLC_OPTS += +debug_info
-TEST_ERLC_OPTS += +'{parse_transform, lager_transform}'
+.PHONY: get-dashboard
+get-dashboard:
+	@$(SCRIPTS)/get-dashboard.sh
 
-EUNIT_OPTS = verbose
-# EUNIT_ERL_OPTS =
+.PHONY: eunit
+eunit: $(REBAR)
+	@ENABLE_COVER_COMPILE=1 $(REBAR) eunit -v -c
 
-CT_SUITES = emqttd emqttd_access emqttd_lib emqttd_inflight emqttd_mod \
-            emqttd_net emqttd_mqueue emqttd_protocol emqttd_topic \
-            emqttd_trie emqttd_vm emqttd_config
+.PHONY: proper
+proper: $(REBAR)
+	@ENABLE_COVER_COMPILE=1 $(REBAR) proper -d test/props -c
 
-CT_OPTS = -cover test/ct.cover.spec -erl_args -name emqttd_ct@127.0.0.1
+.PHONY: ct
+ct: $(REBAR)
+	@ENABLE_COVER_COMPILE=1 $(REBAR) ct --name 'test@127.0.0.1' -c -v
 
-COVER = true
+APPS=$(shell $(CURDIR)/scripts/find-apps.sh)
 
-PLT_APPS = sasl asn1 ssl syntax_tools runtime_tools crypto xmerl os_mon inets public_key ssl lager compiler mnesia
-DIALYZER_DIRS := ebin/
-DIALYZER_OPTS := --verbose --statistics -Werror_handling \
-                 -Wrace_conditions #-Wunmatched_returns
+## app/name-ct targets are intended for local tests hence cover is not enabled
+.PHONY: $(APPS:%=%-ct)
+define gen-app-ct-target
+$1-ct:
+	$(REBAR) ct --name 'test@127.0.0.1' -v --suite $(shell $(CURDIR)/scripts/find-suites.sh $1)
+endef
+$(foreach app,$(APPS),$(eval $(call gen-app-ct-target,$(app))))
 
-include erlang.mk
+## apps/name-prop targets
+.PHONY: $(APPS:%=%-prop)
+define gen-app-prop-target
+$1-prop:
+	$(REBAR) proper -d test/props -v -m $(shell $(CURDIR)/scripts/find-props.sh $1)
+endef
+$(foreach app,$(APPS),$(eval $(call gen-app-prop-target,$(app))))
 
-app:: rebar.config
+.PHONY: cover
+cover: $(REBAR)
+	@ENABLE_COVER_COMPILE=1 $(REBAR) cover
 
-app.config::
-	./deps/cuttlefish/cuttlefish -l info -e etc/ -c etc/emq.conf -i priv/emq.schema -d data/
+.PHONY: coveralls
+coveralls: $(REBAR)
+	@ENABLE_COVER_COMPILE=1 $(REBAR) as test coveralls send
 
+.PHONY: $(REL_PROFILES)
+
+$(REL_PROFILES:%=%): $(REBAR) get-dashboard conf-segs
+	@$(REBAR) as $(@) do compile,release
+
+## Not calling rebar3 clean because
+## 1. rebar3 clean relies on rebar3, meaning it reads config, fetches dependencies etc.
+## 2. it's slow
+## NOTE: this does not force rebar3 to fetch new version dependencies
+## make clean-all to delete all fetched dependencies for a fresh start-over
+.PHONY: clean $(PROFILES:%=clean-%)
+clean: $(PROFILES:%=clean-%)
+$(PROFILES:%=clean-%):
+	@if [ -d _build/$(@:clean-%=%) ]; then \
+		rm -rf _build/$(@:clean-%=%)/rel; \
+		find _build/$(@:clean-%=%) -name '*.beam' -o -name '*.so' -o -name '*.app' -o -name '*.appup' -o -name '*.o' -o -name '*.d' -type f | xargs rm -f; \
+	fi
+
+.PHONY: clean-all
+clean-all:
+	@rm -rf _build
+
+.PHONY: deps-all
+deps-all: $(REBAR) $(PROFILES:%=deps-%)
+
+## deps-<profile> is used in CI scripts to download deps and the
+## share downloads between CI steps and/or copied into containers
+## which may not have the right credentials
+.PHONY: $(PROFILES:%=deps-%)
+$(PROFILES:%=deps-%): $(REBAR) get-dashboard
+	@$(REBAR) as $(@:deps-%=%) get-deps
+
+.PHONY: xref
+xref: $(REBAR)
+	@$(REBAR) as check xref
+
+.PHONY: dialyzer
+dialyzer: $(REBAR)
+	@$(REBAR) as check dialyzer
+
+COMMON_DEPS := $(REBAR) get-dashboard conf-segs
+
+## rel target is to create release package without relup
+.PHONY: $(REL_PROFILES:%=%-rel) $(PKG_PROFILES:%=%-rel)
+$(REL_PROFILES:%=%-rel) $(PKG_PROFILES:%=%-rel): $(COMMON_DEPS)
+	@$(BUILD) $(subst -rel,,$(@)) rel
+
+## relup target is to create relup instructions
+.PHONY: $(REL_PROFILES:%=%-relup)
+define gen-relup-target
+$1-relup: $(COMMON_DEPS)
+	@$(BUILD) $1 relup
+endef
+ALL_ZIPS = $(REL_PROFILES)
+$(foreach zt,$(ALL_ZIPS),$(eval $(call gen-relup-target,$(zt))))
+
+## zip target is to create a release package .zip with relup
+.PHONY: $(REL_PROFILES:%=%-zip)
+define gen-zip-target
+$1-zip: $1-relup
+	@$(BUILD) $1 zip
+endef
+ALL_ZIPS = $(REL_PROFILES)
+$(foreach zt,$(ALL_ZIPS),$(eval $(call gen-zip-target,$(zt))))
+
+## A pkg target depend on a regular release
+.PHONY: $(PKG_PROFILES)
+define gen-pkg-target
+$1: $1-rel
+	@$(BUILD) $1 pkg
+endef
+$(foreach pt,$(PKG_PROFILES),$(eval $(call gen-pkg-target,$(pt))))
+
+.PHONY: run
+run: $(PROFILE) quickrun
+
+.PHONY: quickrun
+quickrun:
+	./_build/$(PROFILE)/rel/emqx/bin/emqx console
+
+include docker.mk
+
+conf-segs:
+	@scripts/merge-config.escript
